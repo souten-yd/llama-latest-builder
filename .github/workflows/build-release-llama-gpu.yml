@@ -8,19 +8,17 @@ on:
         required: false
         default: "false"
         type: choice
-        options: ["false", "true"]
-      enable_linux_rocm:
-        description: "self-hosted Linux ROCm runnerでROCmビルドを実行する"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
+        options:
+          - "false"
+          - "true"
       enable_windows_rocm:
-        description: "self-hosted Windows ROCm runnerでROCmビルドを実行する"
+        description: "self-hosted Windows ROCm runnerを使ってWindows ROCmビルドも実行する"
         required: false
         default: "false"
         type: choice
-        options: ["false", "true"]
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: write
@@ -43,7 +41,10 @@ jobs:
             | sort -V \
             | tail -n1)
 
-          [[ -n "${latest_tag}" ]] || { echo "Failed to resolve latest tag"; exit 1; }
+          if [[ -z "${latest_tag}" ]]; then
+            echo "Failed to resolve latest llama.cpp tag" >&2
+            exit 1
+          fi
 
           release_tag="llama-gpu-${latest_tag}"
           if [[ "${{ github.event.inputs.force_release }}" == "true" ]]; then
@@ -63,43 +64,72 @@ jobs:
           - target: linux-cuda
             runs_on: ubuntu-latest
             backend: cuda
-            ext: tar.gz
+            package_ext: tar.gz
             cmake_flags: -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-            artifact_prefix: llama-linux-cuda
+            artifact: llama-linux-cuda
             cuda_version: 12.4.1
+          - target: linux-rocm
+            runs_on: ubuntu-latest
+            backend: rocm
+            package_ext: tar.gz
+            cmake_flags: -DGGML_HIPBLAS=ON -DCMAKE_BUILD_TYPE=Release
+            artifact: llama-linux-rocm
           - target: linux-vulkan
             runs_on: ubuntu-latest
             backend: vulkan
-            ext: tar.gz
+            package_ext: tar.gz
             cmake_flags: -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-            artifact_prefix: llama-linux-vulkan
+            artifact: llama-linux-vulkan
           - target: windows-cuda
             runs_on: windows-latest
             backend: cuda
-            ext: zip
+            package_ext: zip
             cmake_flags: -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-            artifact_prefix: llama-windows-cuda
+            artifact: llama-windows-cuda
             cuda_version: 12.4.1
           - target: windows-vulkan
             runs_on: windows-latest
             backend: vulkan
-            ext: zip
+            package_ext: zip
             cmake_flags: -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-            artifact_prefix: llama-windows-vulkan
-
+            artifact: llama-windows-vulkan
     steps:
       - name: Checkout current repository
         uses: actions/checkout@v4
 
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@v2
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Install Linux Vulkan dependencies
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends libvulkan-dev vulkan-tools
 
-      - name: Setup MSVC environment
+      - name: Install Linux ROCm dependencies
+        if: runner.os == 'Linux' && matrix.backend == 'rocm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends hipcc rocblas-dev
+
+      - name: Install Windows build dependencies
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        shell: pwsh
+        run: |
+          choco install ninja -y
+
+      - name: Install Windows Vulkan SDK
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y
 
       - name: Setup CUDA toolkit
         if: matrix.backend == 'cuda'
@@ -107,13 +137,6 @@ jobs:
         with:
           cuda: ${{ matrix.cuda_version }}
           method: network
-
-      - name: Setup Vulkan SDK
-        if: matrix.backend == 'vulkan'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: latest
-          vulkan-components: Vulkan-Headers,Vulkan-Loader
 
       - name: Clone latest llama.cpp source
         shell: bash
@@ -126,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake -S llama.cpp -B llama.cpp/build -G Ninja ${{ matrix.cmake_flags }}
-          cmake --build llama.cpp/build --config Release
+          cmake --build llama.cpp/build --config Release -j"$(nproc || sysctl -n hw.logicalcpu || echo 4)"
 
       - name: Verify version
         shell: bash
@@ -137,7 +160,7 @@ jobs:
           elif [[ -x "llama.cpp/build/bin/main" ]]; then
             llama.cpp/build/bin/main --version | head -n1
           else
-            echo "No known binary found" >&2
+            echo "No known binary found for version output" >&2
             exit 1
           fi
 
@@ -146,82 +169,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -C llama.cpp/build -czf "${{ matrix.artifact_prefix }}-${{ needs.prepare.outputs.latest_tag }}.tar.gz" .
+          tar -C llama.cpp/build -czf "${{ matrix.artifact }}-${{ needs.prepare.outputs.latest_tag }}.tar.gz" .
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "llama.cpp/build/*" -DestinationPath "${{ matrix.artifact_prefix }}-${{ needs.prepare.outputs.latest_tag }}.zip" -Force
+          Compress-Archive -Path "llama.cpp/build/*" -DestinationPath "${{ matrix.artifact }}-${{ needs.prepare.outputs.latest_tag }}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_prefix }}-${{ needs.prepare.outputs.latest_tag }}
+          name: ${{ matrix.artifact }}-${{ needs.prepare.outputs.latest_tag }}
           path: |
-            ${{ matrix.artifact_prefix }}-${{ needs.prepare.outputs.latest_tag }}.tar.gz
-            ${{ matrix.artifact_prefix }}-${{ needs.prepare.outputs.latest_tag }}.zip
+            ${{ matrix.artifact }}-${{ needs.prepare.outputs.latest_tag }}.tar.gz
+            ${{ matrix.artifact }}-${{ needs.prepare.outputs.latest_tag }}.zip
           if-no-files-found: error
-
-  build-linux-rocm:
-    if: github.event.inputs.enable_linux_rocm == 'true'
-    needs: prepare
-    runs-on: [self-hosted, linux, rocm]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@v2
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-      - name: Clone latest llama.cpp source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch "${{ needs.prepare.outputs.latest_tag }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
-      - name: Build Linux ROCm target (self-hosted)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S llama.cpp -B llama.cpp/build -G Ninja -DGGML_HIPBLAS=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build llama.cpp/build --config Release
-      - name: Package artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar -C llama.cpp/build -czf "llama-linux-rocm-${{ needs.prepare.outputs.latest_tag }}.tar.gz" .
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: llama-linux-rocm-${{ needs.prepare.outputs.latest_tag }}
-          path: llama-linux-rocm-${{ needs.prepare.outputs.latest_tag }}.tar.gz
 
   build-windows-rocm:
     if: github.event.inputs.enable_windows_rocm == 'true'
     needs: prepare
-    runs-on: [self-hosted, windows, rocm]
+    runs-on:
+      - self-hosted
+      - windows
+      - rocm
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@v2
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
       - name: Clone latest llama.cpp source
         shell: bash
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "${{ needs.prepare.outputs.latest_tag }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
+
       - name: Build Windows ROCm target (self-hosted)
         shell: bash
         run: |
           set -euo pipefail
           cmake -S llama.cpp -B llama.cpp/build -G Ninja -DGGML_HIPBLAS=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build llama.cpp/build --config Release
+          cmake --build llama.cpp/build --config Release -j"$(nproc || echo 4)"
+
       - name: Package artifact
         shell: pwsh
         run: |
           Compress-Archive -Path "llama.cpp/build/*" -DestinationPath "llama-windows-rocm-${{ needs.prepare.outputs.latest_tag }}.zip" -Force
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -232,9 +225,8 @@ jobs:
     needs:
       - prepare
       - build-matrix
-      - build-linux-rocm
       - build-windows-rocm
-    if: always() && needs.prepare.result == 'success' && needs.build-matrix.result == 'success' && (needs.build-linux-rocm.result == 'success' || needs.build-linux-rocm.result == 'skipped') && (needs.build-windows-rocm.result == 'success' || needs.build-windows-rocm.result == 'skipped')
+    if: always() && needs.prepare.result == 'success' && needs.build-matrix.result == 'success' && (needs.build-windows-rocm.result == 'success' || needs.build-windows-rocm.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -264,13 +256,10 @@ jobs:
           body: |
             Automated GPU builds for latest llama.cpp tag.
 
-            Default targets (GitHub-hosted):
-            - Linux: CUDA / Vulkan
+            Included targets:
+            - Linux: CUDA / ROCm / Vulkan
             - Windows: CUDA / Vulkan
-
-            Optional self-hosted targets:
-            - Linux ROCm (`enable_linux_rocm=true`)
-            - Windows ROCm (`enable_windows_rocm=true`)
+            - Windows ROCm: optional self-hosted runner (`enable_windows_rocm=true`)
 
             Upstream tag: `${{ needs.prepare.outputs.latest_tag }}`
           files: artifacts/**/*
