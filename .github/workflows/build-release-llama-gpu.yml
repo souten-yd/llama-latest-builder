@@ -96,7 +96,18 @@ jobs:
             runs_on: ubuntu-22.04
             backend: rocm
             ext: tar.gz
-            cmake_flags: -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGPU_TARGETS=gfx1201 "-DCMAKE_BUILD_RPATH=/opt/rocm/lib" "-DCMAKE_INSTALL_RPATH=/opt/rocm/lib" -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF
+            # GGML_CUDA_FA_ALL_QUANTS は、量子化した KV の組み合わせぶんだけ
+            # FlashAttention のカーネルを作る。既定は OFF で、f16 と一部の
+            # 組み合わせしか入らない。
+            #
+            # 実機で問題になった。ControlDeck は KV を q8_0/q4_0 で持っており、
+            # そのカーネルが無いと llama.cpp は f16 へ変換して走る。
+            #   ggml_cuda_flash_attn_ext_vec: no FlashAttention vector kernel
+            #   compiled for K/V types q8_0-q4_0, converting K and V to f16
+            #   instead (slow)
+            # 変換ぶんで生成が 7% 落ち、KV が f16 になるぶん載る context も減る。
+            # ビルド時間と成果物は増えるが、使う側の設定を制限するよりよい。
+            cmake_flags: -DGGML_HIP=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGPU_TARGETS=gfx1201 "-DCMAKE_BUILD_RPATH=/opt/rocm/lib" "-DCMAKE_INSTALL_RPATH=/opt/rocm/lib" -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF
             artifact_prefix: llama-linux-rocm-r9700
             rocm_version: 10.0.0
             rocm_package: amdrocm-core-dev10.0-gfx1201
